@@ -1,0 +1,122 @@
+name: Build Windows CUDA Binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-cuda:
+    name: Windows CUDA (RTX 4090 + Ryzen 7950X3D)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas"]'
+
+      - name: Configure CMake (Ninja, CUDA, Zen4)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else {
+            $found = Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($found) { $found.FullName } else { $null }
+          }
+
+          if (-not $cudaRoot) {
+            throw 'CUDA toolkit path was not found.'
+          }
+
+          Write-Host "Using CUDA toolkit at: $cudaRoot"
+
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_CUDA_COMPILER="$cudaRoot\\bin\\nvcc.exe" `
+            -DCUDAToolkit_ROOT="$cudaRoot" `
+            -DCMAKE_CUDA_ARCHITECTURES=89-real `
+            -DGGML_CUDA=ON `
+            -DLLAMA_CURL=OFF `
+            -DCMAKE_CUDA_STANDARD=17 `
+            -DGGML_AVX512=ON `
+            -DGGML_AVX512_VNNI=ON `
+            -DGGML_AVX512_VBMI=ON `
+            -DGGML_CUDA_USE_GRAPHS=ON `
+            -DGGML_SCHED_MAX_COPIES=1 `
+            -DGGML_OPENMP=ON `
+            -DCMAKE_C_FLAGS='/clang:-march=znver4 /clang:-fvectorize /clang:-ffp-model=fast /clang:-fno-finite-math-only /clang:-Wno-format /clang:-Wno-unused-variable /clang:-Wno-unused-function /clang:-Wno-gnu-zero-variadic-macro-arguments' `
+            -DCMAKE_CXX_FLAGS='/EHsc /clang:-march=znver4 /clang:-fvectorize /clang:-ffp-model=fast /clang:-fno-finite-math-only /clang:-Wno-format /clang:-Wno-unused-variable /clang:-Wno-unused-function /clang:-Wno-gnu-zero-variadic-macro-arguments'
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Package binaries and runtime DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $cudaRoot = if ($env:CUDA_PATH) { $env:CUDA_PATH } else {
+            $found = Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+            if ($found) { $found.FullName } else { $null }
+          }
+
+          if (-not $cudaRoot) {
+            throw 'CUDA toolkit path was not found.'
+          }
+
+          $artifactRoot = Join-Path $PWD 'artifact'
+          $artifactBin = Join-Path $artifactRoot 'bin'
+
+          New-Item -ItemType Directory -Path $artifactBin -Force | Out-Null
+          Copy-Item -Path 'build/bin/*' -Destination $artifactBin -Recurse -Force
+
+          $cudaDlls = @('cublas64_12.dll', 'cublasLt64_12.dll', 'cudart64_12.dll')
+          foreach ($dll in $cudaDlls) {
+            $source = Join-Path "$cudaRoot\\bin" $dll
+            if (Test-Path $source) {
+              Copy-Item -Path $source -Destination $artifactBin -Force
+            } else {
+              Write-Warning "Expected CUDA runtime DLL not found: $source"
+            }
+          }
+
+          $ompDll = Get-ChildItem -Path 'C:\Windows\System32' -Filter 'libomp140*.dll' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $ompDll) {
+            $ompDll = Get-ChildItem -Path 'C:\Program Files (x86)\Microsoft Visual Studio' -Filter 'libomp140*.dll' -Recurse -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+          }
+
+          if ($ompDll) {
+            Copy-Item -Path $ompDll.FullName -Destination $artifactBin -Force
+          } else {
+            Write-Warning 'libomp140 DLL was not found.'
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cuda-rtx4090-ryzen7950x3d
+          path: artifact
+          if-no-files-found: error
