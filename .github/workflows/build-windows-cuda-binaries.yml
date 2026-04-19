@@ -25,7 +25,6 @@ jobs:
         with:
           cuda: '12.6.2'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas"]'
 
       - name: Configure CMake (Ninja, CUDA, Zen4)
         shell: pwsh
